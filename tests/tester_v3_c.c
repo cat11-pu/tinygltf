@@ -1969,6 +1969,255 @@ static int check_version_rejected(void) {
          !tg3_gltf_version_supported("2.", 2);
 }
 
+/* Find an extension by name inside an extras/extensions holder. */
+static const tg3_extension *find_named_extension(const tg3_extras_ext *ee,
+                                                 const char *name) {
+  uint32_t i;
+  if (!ee || !ee->extensions) return NULL;
+  for (i = 0; i < ee->extensions_count; ++i) {
+    if (tg3_str_equals_cstr(ee->extensions[i].name, name))
+      return &ee->extensions[i];
+  }
+  return NULL;
+}
+
+/* Find a key inside an OBJECT value. NULL when absent or not an object. */
+static const tg3_value *value_object_find(const tg3_value *obj, const char *key) {
+  uint32_t i;
+  if (!obj || obj->type != TG3_VALUE_OBJECT) return NULL;
+  for (i = 0; i < obj->object_count; ++i) {
+    if (tg3_str_equals_cstr(obj->object_data[i].key, key))
+      return &obj->object_data[i].value;
+  }
+  return NULL;
+}
+
+static double value_as_real(const tg3_value *v) {
+  if (!v) return 0.0;
+  if (v->type == TG3_VALUE_INT) return (double)v->int_val;
+  return v->real_val;
+}
+
+/* Portable IEEE-754 negative-zero test (no math.h / compiler builtins). */
+static int is_negative_zero(double v) {
+  uint64_t bits;
+  memcpy(&bits, &v, sizeof(bits));
+  return sizeof(bits) == sizeof(v) && bits == 0x8000000000000000ULL;
+}
+
+/* KHR_texture_transform and KHR_materials_variants must survive a full
+ * parse -> write -> parse round trip with every field intact, including
+ * nested arrays, integer-vs-real typing, and the IEEE-754 negative-zero sign.
+ */
+static int check_extension_roundtrip(void) {
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"extensionsUsed\":[\"KHR_texture_transform\","
+      "\"KHR_materials_variants\",\"FOO_bar\"],"
+      "\"extensionsRequired\":[\"KHR_texture_transform\"],"
+      "\"materials\":[{\"name\":\"mat\","
+      "\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0,"
+      "\"texCoord\":1,\"extensions\":{\"KHR_texture_transform\":{"
+      "\"offset\":[-0.0,0.75],\"rotation\":1.5707963267948966,"
+      "\"scale\":[2,3],\"texCoord\":2}}}}}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},"
+      "\"material\":0,\"extensions\":{"
+      "\"KHR_materials_variants\":{\"variants\":["
+      "{\"name\":\"red\"},{\"name\":\"blue\"}],"
+      "\"mappings\":[{\"variants\":[0,2],\"material\":1},"
+      "{\"variants\":[1],\"material\":2}]},"
+      "\"FOO_bar\":{\"nested\":{\"a\":[1,2.5,true,null,\"hi\"]}}}}]}]}";
+  tg3_model src;
+  tg3_model rt;
+  tg3_error_stack errors;
+  tg3_parse_options parse_opts;
+  tg3_write_options write_opts;
+  tg3_error_code err;
+  uint8_t *out = NULL;
+  uint64_t out_size = 0;
+  const tg3_extension *tt;
+  const tg3_extension *mv;
+  const tg3_extension *foo;
+  const tg3_value *off, *rot, *scale, *texc;
+  const tg3_value *mappings, *m0, *variants0;
+  int ok = 1;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&parse_opts);
+  tg3_write_options_init(&write_opts);
+  parse_opts.validate_indices = 0;
+  parse_opts.validate_ranges = 0;
+
+  err = tg3_parse(&src, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0,
+                  &parse_opts);
+  if (err != TG3_OK) {
+    fprintf(stderr, "extension roundtrip source parse failed: %d\n", (int)err);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  err = tg3_write_to_memory(&src, &errors, &out, &out_size, &write_opts);
+  if (err != TG3_OK || !out) {
+    fprintf(stderr, "extension roundtrip write failed: %d\n", (int)err);
+    tg3_model_free(&src);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  err = tg3_parse(&rt, &errors, out, out_size, "", 0, &parse_opts);
+  if (err != TG3_OK) {
+    fprintf(stderr, "extension roundtrip reparse failed: %d\n", (int)err);
+    ok = 0;
+    goto done;
+  }
+
+  if (rt.materials_count != 1 || rt.meshes_count != 1 ||
+      rt.meshes[0].primitives_count != 1) {
+    fprintf(stderr, "extension roundtrip topology changed\n");
+    ok = 0;
+    goto done;
+  }
+
+  /* ---- KHR_texture_transform on baseColorTexture ---- */
+  tt = find_named_extension(
+      &rt.materials[0].pbr_metallic_roughness.base_color_texture.ext,
+      "KHR_texture_transform");
+  if (!tt || tt->value.type != TG3_VALUE_OBJECT) {
+    fprintf(stderr, "KHR_texture_transform missing after roundtrip\n");
+    ok = 0;
+    goto done;
+  }
+  off = value_object_find(&tt->value, "offset");
+  rot = value_object_find(&tt->value, "rotation");
+  scale = value_object_find(&tt->value, "scale");
+  texc = value_object_find(&tt->value, "texCoord");
+  if (!off || off->type != TG3_VALUE_ARRAY || off->array_count != 2 ||
+      value_as_real(&off->array_data[1]) != 0.75) {
+    fprintf(stderr, "texture_transform.offset mismatch\n");
+    ok = 0;
+  }
+  /* Negative zero must keep its sign bit across the round trip. */
+  if (!off || off->array_data[0].type != TG3_VALUE_REAL ||
+      !is_negative_zero(off->array_data[0].real_val)) {
+    fprintf(stderr, "texture_transform.offset[0] lost negative-zero sign\n");
+    ok = 0;
+  }
+  if (!rot || rot->type != TG3_VALUE_REAL ||
+      rot->real_val != 1.5707963267948966) {
+    fprintf(stderr, "texture_transform.rotation mismatch\n");
+    ok = 0;
+  }
+  if (!scale || scale->type != TG3_VALUE_ARRAY || scale->array_count != 2 ||
+      scale->array_data[0].type != TG3_VALUE_INT ||
+      scale->array_data[0].int_val != 2 ||
+      scale->array_data[1].int_val != 3) {
+    fprintf(stderr, "texture_transform.scale mismatch (values/typing)\n");
+    ok = 0;
+  }
+  if (!texc || texc->type != TG3_VALUE_INT || texc->int_val != 2) {
+    fprintf(stderr, "texture_transform.texCoord mismatch\n");
+    ok = 0;
+  }
+
+  /* ---- KHR_materials_variants on the primitive ---- */
+  mv = find_named_extension(&rt.meshes[0].primitives[0].ext,
+                            "KHR_materials_variants");
+  if (!mv || mv->value.type != TG3_VALUE_OBJECT) {
+    fprintf(stderr, "KHR_materials_variants missing after roundtrip\n");
+    ok = 0;
+    goto done;
+  }
+  mappings = value_object_find(&mv->value, "mappings");
+  if (!mappings || mappings->type != TG3_VALUE_ARRAY ||
+      mappings->array_count != 2) {
+    fprintf(stderr, "materials_variants.mappings mismatch\n");
+    ok = 0;
+  } else {
+    m0 = &mappings->array_data[0];
+    variants0 = value_object_find(m0, "variants");
+    if (!variants0 || variants0->array_count != 2 ||
+        variants0->array_data[0].int_val != 0 ||
+        variants0->array_data[1].int_val != 2 ||
+        value_object_find(m0, "material")->int_val != 1) {
+      fprintf(stderr, "materials_variants.mappings[0] field mismatch\n");
+      ok = 0;
+    }
+  }
+
+  /* ---- Unknown extension preserved verbatim ---- */
+  foo = find_named_extension(&rt.meshes[0].primitives[0].ext, "FOO_bar");
+  if (!foo || !value_object_find(&foo->value, "nested")) {
+    fprintf(stderr, "unknown FOO_bar extension dropped on roundtrip\n");
+    ok = 0;
+  }
+
+done:
+  if (out) tg3_write_free(out, &write_opts);
+  tg3_model_free(&src);
+  tg3_model_free(&rt);
+  tg3_error_stack_free(&errors);
+  return ok;
+}
+
+/* Unknown extensions must be retained on every object kind that carries an
+ * extensions holder, and promoted (named) extensions must keep vendor-specific
+ * sibling fields instead of being replaced by a synthesized minimal object. */
+static int check_unknown_extensions_preserved(void) {
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\","
+      "\"extensions\":{\"VENDOR_root\":{\"answer\":42}}},"
+      "\"buffers\":[{\"byteLength\":1,\"extensions\":{\"VENDOR_buffer\":{\"k\":2}}}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":1,"
+      "\"extensions\":{\"VENDOR_bv\":{\"k\":3}}}],"
+      "\"nodes\":[{\"extensions\":{"
+      "\"KHR_lights_punctual\":{\"light\":0,\"vendorData\":[1,2,3]},"
+      "\"MSFT_lod\":{\"ids\":[2],\"note\":\"keep\"}}}],"
+      "\"materials\":[{\"extensions\":{\"VENDOR_material\":{\"flag\":true}}}],"
+      "\"meshes\":[{\"primitives\":[{\"extensions\":{\"VENDOR_prim\":{}}}]}]}";
+  static const char *const needles[] = {
+      "VENDOR_root", "VENDOR_buffer", "VENDOR_bv", "VENDOR_material",
+      "VENDOR_prim", "vendorData", "\"note\"",
+  };
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options parse_opts;
+  tg3_write_options write_opts;
+  tg3_error_code err;
+  uint8_t *out = NULL;
+  uint64_t out_size = 0;
+  size_t i;
+  int ok = 1;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&parse_opts);
+  tg3_write_options_init(&write_opts);
+  parse_opts.validate_indices = 0;
+  parse_opts.validate_ranges = 0;
+
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0,
+                  &parse_opts);
+  if (err != TG3_OK) {
+    fprintf(stderr, "unknown-extension source parse failed: %d\n", (int)err);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  err = tg3_write_to_memory(&model, &errors, &out, &out_size, &write_opts);
+  if (err != TG3_OK || !out) {
+    fprintf(stderr, "unknown-extension write failed: %d\n", (int)err);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  for (i = 0; i < sizeof(needles) / sizeof(needles[0]); ++i) {
+    if (!mem_contains(out, out_size, needles[i])) {
+      fprintf(stderr, "unknown extension field lost on write: %s\n", needles[i]);
+      ok = 0;
+    }
+  }
+  if (out) tg3_write_free(out, &write_opts);
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return ok;
+}
+
 int main(int argc, char **argv) {
   if (argc > 1) {
     int i;
@@ -2092,6 +2341,12 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (!check_stdio_write_regression_cases()) {
+    return 1;
+  }
+  if (!check_extension_roundtrip()) {
+    return 1;
+  }
+  if (!check_unknown_extensions_preserved()) {
     return 1;
   }
   return 0;

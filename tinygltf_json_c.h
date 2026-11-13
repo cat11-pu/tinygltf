@@ -606,6 +606,10 @@ static char *tg3json__dtoa_c(double value, char *buf) {
         return buf + 3;
     }
     if (abits == 0) {
+        /* Preserve the negative-zero sign bit so the value round-trips
+         * exactly (JSON has no separate -0 type, but "-0" is valid and
+         * decodes back to IEEE-754 -0.0). */
+        if (negative) *buf++ = '-';
         *buf++ = '0';
         return buf;
     }
@@ -1194,6 +1198,16 @@ static int tg3json__parse_number(tg3json__parser *parser, tg3json_value *out_val
     }
 
     if (!is_real) {
+        /* A leading '-' followed only by zeros is the integer-spelling of
+         * IEEE-754 negative zero ("-0"). Keep it as a REAL -0.0 so the sign
+         * bit and numeric type round-trip instead of collapsing to INT 0. */
+        if (start[0] == '-' && (p - start) == 2 && start[1] == '0') {
+            out_value->type = TG3JSON_REAL;
+            out_value->u.real = (double)(-0.0);
+            if (parser->parse_float32) out_value->u.real = (double)(float)out_value->u.real;
+            parser->cur = p;
+            return 1;
+        }
         int64_t v;
         if (tg3json__parse_int64_span(start, p, &v)) {
             out_value->type = TG3JSON_INT;

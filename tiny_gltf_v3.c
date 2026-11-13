@@ -3762,7 +3762,7 @@ fail:
 
 static int tg3__serialize_node(const tg3_node *n, int wd, tg3json_value *out) {
     tg3json_value *exts = NULL;
-    tg3json_value tmp;
+    tg3json_value *promoted = NULL;
     int has_t, has_r, has_s;
     tg3json_value_init_object(out);
     if (!tg3__serialize_str(out, "name", n->name) ||
@@ -3785,26 +3785,26 @@ static int tg3__serialize_node(const tg3_node *n, int wd, tg3json_value *out) {
     if (n->light >= 0 || n->emitter >= 0 || (n->lods && n->lods_count > 0)) {
         if (!tg3__json_ensure_object(out, "extensions", &exts)) goto fail;
         if (n->light >= 0) {
-            tg3json_value_init_object(&tmp);
-            if (!tg3__json_set_int(&tmp, "light", n->light) ||
-                !tg3__json_set_take(exts, "KHR_lights_punctual", &tmp)) {
-                tg3json_value_free(&tmp);
+            /* The generic extension tree is the authoritative round-trip
+             * copy: merge the promoted scalar into it instead of replacing
+             * the whole object (which would drop unknown sibling fields). */
+            if (!tg3__json_ensure_object(exts, "KHR_lights_punctual", &promoted)) goto fail;
+            if (!tg3json_object_get_mut(promoted, "light") &&
+                !tg3__json_set_int(promoted, "light", n->light)) {
                 goto fail;
             }
         }
         if (n->emitter >= 0) {
-            tg3json_value_init_object(&tmp);
-            if (!tg3__json_set_int(&tmp, "emitter", n->emitter) ||
-                !tg3__json_set_take(exts, "KHR_audio", &tmp)) {
-                tg3json_value_free(&tmp);
+            if (!tg3__json_ensure_object(exts, "KHR_audio", &promoted)) goto fail;
+            if (!tg3json_object_get_mut(promoted, "emitter") &&
+                !tg3__json_set_int(promoted, "emitter", n->emitter)) {
                 goto fail;
             }
         }
         if (n->lods && n->lods_count > 0) {
-            tg3json_value_init_object(&tmp);
-            if (!tg3__serialize_int_array(&tmp, "ids", n->lods, n->lods_count) ||
-                !tg3__json_set_take(exts, "MSFT_lod", &tmp)) {
-                tg3json_value_free(&tmp);
+            if (!tg3__json_ensure_object(exts, "MSFT_lod", &promoted)) goto fail;
+            if (!tg3json_object_get_mut(promoted, "ids") &&
+                !tg3__serialize_int_array(promoted, "ids", n->lods, n->lods_count)) {
                 goto fail;
             }
         }
@@ -3990,7 +3990,7 @@ fail:
 static int tg3__serialize_model(const tg3_model *model, int wd,
                                 int embed_images, int embed_buffers,
                                 tg3json_value *out) {
-    tg3json_value asset, arr, item, lights_ext, lights, *exts;
+    tg3json_value asset, arr, item, lights, *exts;
     uint32_t i;
     tg3json_value_init_object(out);
     if (!tg3__serialize_asset(&model->asset, wd, &asset) ||
@@ -4036,28 +4036,32 @@ static int tg3__serialize_model(const tg3_model *model, int wd,
 
 #undef TG3__SERIALIZE_ARRAY_FIELD
 
+    if (!tg3__serialize_extras_ext(out, &model->ext)) goto fail;
     if (model->lights && model->lights_count > 0) {
-        tg3json_value_init_object(&lights_ext);
-        tg3json_value_init_array(&lights);
-        for (i = 0; i < model->lights_count; ++i) {
-            tg3json_value_init_null(&item);
-            if (!tg3__serialize_light(&model->lights[i], wd, &item) ||
-                !tg3__json_push_take(&lights, &item)) {
-                tg3json_value_free(&item);
+        tg3json_value *lights_promoted = NULL;
+        /* Generic extension tree is authoritative; merge the promoted lights
+         * array so unknown sibling fields on KHR_lights_punctual survive. */
+        if (!tg3__json_ensure_object(out, "extensions", &exts) ||
+            !tg3__json_ensure_object(exts, "KHR_lights_punctual", &lights_promoted)) {
+            goto fail;
+        }
+        if (!tg3json_object_get_mut(lights_promoted, "lights")) {
+            tg3json_value_init_array(&lights);
+            for (i = 0; i < model->lights_count; ++i) {
+                tg3json_value_init_null(&item);
+                if (!tg3__serialize_light(&model->lights[i], wd, &item) ||
+                    !tg3__json_push_take(&lights, &item)) {
+                    tg3json_value_free(&item);
+                    tg3json_value_free(&lights);
+                    goto fail;
+                }
+            }
+            if (!tg3__json_set_take(lights_promoted, "lights", &lights)) {
                 tg3json_value_free(&lights);
-                tg3json_value_free(&lights_ext);
                 goto fail;
             }
         }
-        if (!tg3__json_set_take(&lights_ext, "lights", &lights) ||
-            !tg3__json_ensure_object(out, "extensions", &exts) ||
-            !tg3__json_set_take(exts, "KHR_lights_punctual", &lights_ext)) {
-            tg3json_value_free(&lights);
-            tg3json_value_free(&lights_ext);
-            goto fail;
-        }
     }
-    if (!tg3__serialize_extras_ext(out, &model->ext)) goto fail;
     return 1;
 fail:
     tg3json_value_free(out);

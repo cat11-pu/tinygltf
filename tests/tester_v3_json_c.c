@@ -133,6 +133,46 @@ static int check_nonfinite_stringifies_to_null(void) {
   return ok;
 }
 
+/* "-0" (no decimal point) must parse as REAL negative zero, not INT 0, and
+ * stringify back to "-0" so the sign bit survives a JSON round trip. */
+static int check_negative_zero(void) {
+  tg3json_value v;
+  const char *err = NULL;
+  char *out;
+  size_t len = 0;
+  if (!tg3json_parse("-0", (const char *)"-0" + 2, 128, &v, &err)) {
+    fprintf(stderr, "negative-zero parse failed: -0\n");
+    return 0;
+  }
+  if (v.type != TG3JSON_REAL || dbl_bits(v.u.real) != 0x8000000000000000ULL) {
+    fprintf(stderr, "negative-zero not REAL -0.0: type=%d\n", v.type);
+    tg3json_value_free(&v);
+    return 0;
+  }
+  out = tg3json_stringify(&v, &len);
+  if (!out || strcmp(out, "-0") != 0) {
+    fprintf(stderr, "negative-zero stringify mismatch: got %s\n", out ? out : "(null)");
+    TINYGLTF_JSON_FREE(out);
+    tg3json_value_free(&v);
+    return 0;
+  }
+  TINYGLTF_JSON_FREE(out);
+  tg3json_value_free(&v);
+  /* Positive integer zero stays an INT. */
+  {
+    tg3json_value v;
+    const char *err = NULL;
+    if (!tg3json_parse("0", (const char *)"0" + 1, 128, &v, &err) ||
+        v.type != TG3JSON_INT || v.u.integer != 0) {
+      fprintf(stderr, "positive zero must remain INT 0\n");
+      tg3json_value_free(&v);
+      return 0;
+    }
+    tg3json_value_free(&v);
+  }
+  return 1;
+}
+
 int main(void) {
   int ok = 1;
   ok = check_stringify("1.0", "1") && ok;
@@ -153,6 +193,7 @@ int main(void) {
   ok = check_parse_bits("1.7976931348623157e308", 0x7fefffffffffffffULL) && ok;
   ok = check_parse_float32() && ok;
   ok = check_nonfinite_stringifies_to_null() && ok;
+  ok = check_negative_zero() && ok;
   ok = check_parse_rejects("+1") && ok;
   ok = check_parse_rejects("01") && ok;
   ok = check_parse_rejects("1.") && ok;
