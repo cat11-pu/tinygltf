@@ -57,6 +57,19 @@
  *      TG3_ERR_INVALID_INDEX. Set opts.validate_indices = 0 only when you
  *      need to round-trip raw or extension data and have your own validator.
  *
+ *   2b. Structural validation (all default-on).
+ *      validate_ranges rejects buffer/bufferView/accessor/sparse byte ranges
+ *      that exceed their backing storage and unknown component types.
+ *      validate_node_graph rejects node hierarchy cycles and duplicate child
+ *      references (TG3_ERR_NODE_CYCLE) using an iterative DFS, so a crafted
+ *      deep/cyclic graph cannot recurse off the C stack.
+ *      validate_accessor_usage rejects mesh primitives whose accessor element
+ *      shape does not match the attribute semantics (POSITION must be VEC3
+ *      float, indices SCALAR integer, JOINTS_* integer, ...) with
+ *      TG3_ERR_INVALID_ATTRIBUTE. For a standalone gate use
+ *      tg3_validate_model() with a tg3_validation_options; every diagnostic
+ *      carries a JSON path and a reason string.
+ *
  *   3. Image decoding. The parser does not decode image bytes by default.
  *      Set opts.images_as_is = 1 (already the safe default for untrusted
  *      input) to skip any decoder and store raw bytes only.
@@ -368,6 +381,8 @@ typedef enum tg3_error_code {
     TG3_ERR_INVALID_CAMERA     = 43,
     TG3_ERR_INVALID_SCENE      = 44,
     TG3_ERR_BUFFER_SIZE_MISMATCH = 45,
+    TG3_ERR_NODE_CYCLE         = 46,
+    TG3_ERR_INVALID_ATTRIBUTE  = 47,
 
     /* Resource errors: 50-59 */
     TG3_ERR_OUT_OF_MEMORY      = 50,
@@ -1028,8 +1043,35 @@ typedef struct tg3_parse_options {
                                          *     and invalid component types.
                                          *     Default: 1. Set to 0 only when the
                                          *     caller performs its own checks. */
+    int32_t  validate_node_graph;       /* 1 = reject node hierarchy cycles and
+                                        *     duplicated child references, which
+                                        *     make recursive traversal loop or
+                                        *     visit a node twice. Default: 1. */
+    int32_t  validate_accessor_usage;   /* 1 = reject mesh primitive attribute
+                                        *     semantics that do not match the
+                                        *     accessor element type/count (e.g.
+                                        *     POSITION not VEC3, indices not
+                                        *     SCALAR). Default: 1. */
     uint64_t max_external_file_size;    /* 0 = no limit */
 } tg3_parse_options;
+
+/* Independent pre-decode validation configuration. Used by tg3_validate_model
+ * to check an untrusted model before the application dereferences any index
+ * or byte range. Every check class is enabled by default; zero the struct and
+ * set strictness to opt into individual checks. The checks never allocate
+ * beyond bounded, caller-provided scratch storage (plus error diagnostics). */
+typedef struct tg3_validation_options {
+    tg3_strictness strictness; /* TG3_PERMISSIVE (default) or TG3_STRICT */
+    int32_t check_indices;          /* index fields resolve inside model arrays */
+    int32_t check_ranges;           /* buffer/bufferView/accessor byte ranges */
+    int32_t check_node_graph;       /* node cycles, duplicate children */
+    int32_t check_accessor_usage;   /* primitive attribute type semantics */
+    uint32_t max_errors;            /* caps node-graph diagnostics; 0 = all.
+                                     * Other check classes have their own
+                                     * bounded diagnostic cap. */
+} tg3_validation_options;
+
+TINYGLTF3_API void tg3_validation_options_init(tg3_validation_options *options);
 
 typedef struct tg3_write_options {
     int32_t          pretty_print;     /* 1 = indented JSON */
@@ -1160,6 +1202,23 @@ TINYGLTF3_API int32_t tg3_is_data_uri(const char *uri, uint32_t len);
 TINYGLTF3_API tg3_error_code tg3_validate(const tg3_model *model,
                                           tg3_strictness strictness,
                                           tg3_error_stack *errors);
+
+/* Independent validation entry point with per-check-class control. Runs only
+ * the enabled safety checks from `options` (default from
+ * tg3_validation_options_init: all checks on) and appends one diagnostic per
+ * defect, carrying a JSON path (e.g. "/nodes/3/children/0") and a human
+ * readable reason. Returns TG3_OK when no error-severity diagnostic was
+ * produced. `scratch` must hold at least model->nodes_count uint8_t bytes for
+ * node-graph traversal; when check_node_graph is enabled and the model has
+ * nodes, provide model->nodes_count * (sizeof(uint32_t) * 2 + 1) bytes of
+ * 4-byte-aligned storage (a uint32_t array works), otherwise node-graph checks
+ * report TG3_ERR_INVALID_NODE. It may be NULL when check_node_graph is
+ * disabled (or the model has no nodes). This routine does not parse or load
+ * resources and is linear in the model size, suitable as a gate before
+ * decoding buffers. */
+TINYGLTF3_API tg3_error_code tg3_validate_model(
+    const tg3_model *model, const tg3_validation_options *options,
+    tg3_error_stack *errors, uint8_t *scratch, uint64_t scratch_size);
 
 /* Check if a glTF version string is supported ("2.0" .. "2.9") */
 TINYGLTF3_API int32_t tg3_gltf_version_supported(const char *version, uint32_t len);

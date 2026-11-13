@@ -78,6 +78,7 @@ tests/tester_v3_c_v1port
 tests/tester_v3_c_v1port_cpp
 tests/tester_v3_freestanding
 tests/tester_v3_json_c
+tests/validate_stress
 tests/v3/fuzzer/fuzz_gltf_v3
 tests/v3/fuzzer/fuzz_gltf_v3_c
 

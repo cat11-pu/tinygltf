@@ -49,4 +49,13 @@ if get_option('tests')
     install: false,
   )
   test('tester_v3_freestanding', tester_v3_freestanding, workdir: tests_workdir)
+
+  validate_stress = executable(
+    'validate_stress',
+    ['tests/v3/security/validate_stress.c', 'tiny_gltf_v3.c'],
+    include_directories: tinygltf_inc,
+    c_args: ['-DTINYGLTF3_ENABLE_FS'],
+    install: false,
+  )
+  test('validate_stress', validate_stress, workdir: tests_workdir)
 endif

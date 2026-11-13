@@ -13,7 +13,7 @@ https://github.com/KhronosGroup/glTF loader and writer, with experimental
 - **Streaming callbacks** — opt-in streaming parse/write via user-supplied callbacks.
 - **Opt-in filesystem and image I/O** — `TINYGLTF3_ENABLE_FS` / `TINYGLTF3_ENABLE_STB_IMAGE` are off by default; you control when and how assets are loaded.
 - **C++20 coroutine facade** (optional, auto-detected). C17/C++17 default.
-- **Hardened against untrusted input** — URI sanitization, post-parse index-bounds and byte-range validation (default-on, opt-out via `tg3_parse_options.validate_indices` / `validate_ranges`), strict numeric range checks; exercised by a libFuzzer harness. See the `Security Considerations` block at the top of `tiny_gltf_v3.h`.
+- **Hardened against untrusted input** — URI sanitization, post-parse index-bounds, byte-range, node-graph cycle and accessor-shape validation (all default-on, opt-out via the `validate_*` fields of `tg3_parse_options`), strict numeric range checks; a standalone `tg3_validate_model()` gate and a 1000-sample malformed-corpus stress harness back the libFuzzer coverage. See the `Security Considerations` block at the top of `tiny_gltf_v3.h`.
 - **Strictness levels** — spec-conformance violations are warnings by default (`TG3_PERMISSIVE`) and errors under `TG3_STRICT`; `tg3_validate()` checks hand-built models with the same rules.
 - **Formal specification and machine-checked proofs** — a Lean 4 specification of the validation rules and GLB framing, and a Lean proof that the C GLB framing code is free of undefined behaviour and refines the specification. See [`formal/`](formal/README.md).
 
@@ -68,6 +68,17 @@ Validation rules come in two classes (the normative list is
 | Memory safety | out-of-range indices, accessor/bufferView byte ranges, unknown component types | error | error |
 | Spec conformance | `alphaMode`, primitive `mode`, sampler filters, camera parameters, factor ranges, `byteStride` alignment, `extensionsRequired ⊆ extensionsUsed` | warning | error (`TG3_ERR_INVALID_VALUE`) |
 
+The memory-safety gate also covers two structural attacks that naive
+consumers otherwise dereference blindly: **node hierarchy cycles / duplicate
+child references** (`TG3_ERR_NODE_CYCLE`, found with an iterative DFS so a
+malicious 200k-node chain cannot overflow the C stack) and **mesh primitive
+accessor shape mismatches** (`TG3_ERR_INVALID_ATTRIBUTE`, e.g. a SCALAR
+accessor feeding `POSITION`, or float `VEC3` indices). Both are default-on and
+individually opt-out via `tg3_parse_options.validate_node_graph` /
+`validate_accessor_usage`, alongside the existing `validate_indices` /
+`validate_ranges` switches. Every diagnostic carries a JSON path
+(`/nodes/3/children/0`) and a human-readable reason.
+
 ```c
 tg3_parse_options opts;
 tg3_parse_options_init(&opts);
@@ -75,6 +86,24 @@ opts.strictness = TG3_STRICT;          /* reject non-conforming files */
 ...
 tg3_validate(&model, TG3_STRICT, &errors);   /* same rules for any model */
 ```
+
+For an explicit pre-decode gate with per-check-class control (and no parse
+coupling), use `tg3_validate_model` with a `tg3_validation_options`:
+
+```c
+tg3_validation_options vopts;
+tg3_validation_options_init(&vopts);   /* all four safety checks on */
+vopts.check_ranges = 0;                /* skip a class on demand */
+uint32_t words[256];                   /* 4-byte-aligned node-graph scratch */
+tg3_error_code e = tg3_validate_model(&model, &vopts, &errors,
+                                      (uint8_t *)words, sizeof(words));
+```
+
+The check is linear in model size and allocation-light; on the included
+malformed corpus the per-file parse+validate time is well under 1 ms
+(budget enforced at 50 ms). `tests/v3/security/validate_stress.c` builds a
+1000-document malformed/valid corpus and asserts no crash, a readable reason
+for every defect, and zero false positives (`make -C tests validate_stress`).
 
 ## glTF 2.1 (spec-unstable)
 

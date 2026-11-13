@@ -43,6 +43,10 @@ if (TINYGLTF3_BUILD_TESTS)
   if (CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(tester_v3_freestanding PRIVATE -ffreestanding)
   endif()
+
+  add_tinygltf_v3_c_test(validate_stress
+    tests/v3/security/validate_stress.c tiny_gltf_v3.c)
+  target_compile_definitions(validate_stress PRIVATE TINYGLTF3_ENABLE_FS)
 endif ()
 
 if (TINYGLTF3_INSTALL)

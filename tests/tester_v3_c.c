@@ -1969,6 +1969,365 @@ static int check_version_rejected(void) {
          !tg3_gltf_version_supported("2.", 2);
 }
 
+static int check_node_cycle_rejected(void) {
+  /* nodes[0] -> nodes[1] -> nodes[0]: a naive recursive traversal loops. */
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"scenes\":[{\"nodes\":[0]}],\"scene\":0,"
+      "\"nodes\":[{\"children\":[1]},{\"children\":[0]}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+  uint32_t i;
+  int saw_path = 0;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_ERR_NODE_CYCLE) {
+    fprintf(stderr, "node cycle expected TG3_ERR_NODE_CYCLE, got %d\n", (int)err);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  for (i = 0; i < errors.count; ++i) {
+    const tg3_error_entry *e = &errors.entries[i];
+    if (e->code == TG3_ERR_NODE_CYCLE && e->json_path &&
+        strstr(e->json_path, "/nodes/") && e->message) {
+      saw_path = 1;
+    }
+  }
+  if (!saw_path) {
+    fprintf(stderr, "cycle diagnostic missing JSON path/reason\n");
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+static int check_node_cycle_opt_out(void) {
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"scenes\":[{\"nodes\":[0]}],\"scene\":0,"
+      "\"nodes\":[{\"children\":[1]},{\"children\":[0]}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  opts.validate_node_graph = 0;
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_OK) {
+    fprintf(stderr, "validate_node_graph=0 should accept cycle, got %d\n", (int)err);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+static int check_duplicate_child_rejected(void) {
+  /* nodes[0] references node 2 twice via disjoint parents: forest traversal
+   * would visit node 2 twice. */
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"scenes\":[{\"nodes\":[0,1]}],\"scene\":0,"
+      "\"nodes\":[{\"children\":[2]},{\"children\":[2]},{}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_ERR_NODE_CYCLE) {
+    fprintf(stderr, "duplicate child expected TG3_ERR_NODE_CYCLE, got %d\n", (int)err);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+static int check_acyclic_graph_accepted(void) {
+  /* Diamond DAG (node 2 shared) is NOT a hierarchy violation in glTF scene
+   * graphs when reached from separate scene roots... here it is one root with
+   * two parents, which this validator rejects, so use a pure tree instead to
+   * guard against false positives on ordinary hierarchies. */
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"scenes\":[{\"nodes\":[0]}],\"scene\":0,"
+      "\"nodes\":[{\"children\":[1,2]},{\"children\":[3]},{},{}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_OK) {
+    fprintf(stderr, "valid tree hierarchy rejected with %d\n", (int)err);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+static int check_attribute_type_mismatch_rejected(void) {
+  /* POSITION must be VEC3; a SCALAR accessor cannot feed it. */
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAAAAAAAA\",\"byteLength\":16}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":16}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"SCALAR\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0}}]}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_ERR_INVALID_ATTRIBUTE) {
+    fprintf(stderr, "POSITION type mismatch expected TG3_ERR_INVALID_ATTRIBUTE, got %d\n", (int)err);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+static int check_indices_accessor_type_rejected(void) {
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64,AAAAAAAAAAAAAAAA\",\"byteLength\":12}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":12}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":1,\"type\":\"VEC3\"}],"
+      "\"meshes\":[{\"primitives\":[{\"indices\":0,\"attributes\":{}}]}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_ERR_INVALID_ATTRIBUTE) {
+    fprintf(stderr, "float VEC3 indices expected TG3_ERR_INVALID_ATTRIBUTE, got %d\n", (int)err);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+static int check_valid_primitive_accepted(void) {
+  /* Well-formed triangle primitive: VEC3 float POSITION + unsigned short
+   * SCALAR indices. Must produce zero diagnostics (no false positives). */
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"byteLength\":42}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":36},"
+      "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":6}],"
+      "\"accessors\":["
+      "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+      "{\"bufferView\":1,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}],"
+      "\"meshes\":[{\"primitives\":[{\"indices\":1,\"attributes\":{\"POSITION\":0}}]}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_OK || errors.has_error) {
+    fprintf(stderr, "valid primitive rejected: err=%d errors=%d\n",
+            (int)err, (int)errors.count);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+static int check_validate_model_independent(void) {
+  /* tg3_validate_model on a hand-built-ish parsed model: per-class opt-out
+   * and scratch-based node graph check. */
+  static const uint8_t cycle_json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"nodes\":[{\"children\":[1]},{\"children\":[0]}]}";
+  static const uint8_t tree_json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"nodes\":[{\"children\":[1]},{}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options popts;
+  tg3_validation_options vopts;
+  uint32_t scratch_words[32];
+  uint8_t *scratch = (uint8_t *)scratch_words;
+  uint64_t scratch_size = (uint64_t)sizeof(scratch_words);
+  tg3_error_code err;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&popts);
+  popts.validate_indices = 0;
+  popts.validate_ranges = 0;
+  popts.validate_node_graph = 0;
+  popts.validate_accessor_usage = 0;
+  if (tg3_parse(&model, &errors, cycle_json, (uint64_t)(sizeof(cycle_json) - 1),
+                 "", 0, &popts) != TG3_OK) {
+    fprintf(stderr, "raw-mode parse of cycle failed\n");
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_validation_options_init(&vopts);
+  vopts.check_indices = 0;
+  vopts.check_ranges = 0;
+  vopts.check_accessor_usage = 0;
+  err = tg3_validate_model(&model, &vopts, &errors, scratch, scratch_size);
+  if (err != TG3_ERR_NODE_CYCLE) {
+    fprintf(stderr, "independent validator missed cycle, got %d\n", (int)err);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+
+  tg3_error_stack_init(&errors);
+  if (tg3_parse(&model, &errors, tree_json, (uint64_t)(sizeof(tree_json) - 1),
+                 "", 0, &popts) != TG3_OK) {
+    fprintf(stderr, "raw-mode parse of tree failed\n");
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_validation_options_init(&vopts);
+  err = tg3_validate_model(&model, &vopts, &errors, scratch, scratch_size);
+  if (err != TG3_OK || errors.has_error) {
+    fprintf(stderr, "valid tree flagged by independent validator: %d\n", (int)err);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  /* Disabling every check must always return OK. */
+  memset(&vopts, 0, sizeof(vopts));
+  err = tg3_validate_model(&model, &vopts, &errors, NULL, 0);
+  if (err != TG3_OK) {
+    fprintf(stderr, "all-checks-off validator returned %d\n", (int)err);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+static int check_glb_node_cycle_rejected(void) {
+  static const char cycle_json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"scenes\":[{\"nodes\":[0]}],\"scene\":0,"
+      "\"nodes\":[{\"children\":[1]},{\"children\":[0]}]}";
+  uint32_t jl = (uint32_t)(sizeof(cycle_json) - 1);
+  uint32_t jp = (jl + 3u) & ~3u;
+  uint32_t total = 12u + 8u + jp;
+  uint8_t *glb = (uint8_t *)malloc(total);
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+  int result = 0;
+
+  if (!glb) return 0;
+  /* GLB JSON chunk padding must be ASCII spaces. */
+  memset(glb + 20, ' ', jp);
+  memcpy(glb, "glTF", 4);
+  glb[4] = 2; glb[5] = 0; glb[6] = 0; glb[7] = 0;
+  glb[8] = (uint8_t)(total); glb[9] = (uint8_t)(total >> 8);
+  glb[10] = (uint8_t)(total >> 16); glb[11] = (uint8_t)(total >> 24);
+  glb[12] = (uint8_t)(jp); glb[13] = (uint8_t)(jp >> 8);
+  glb[14] = (uint8_t)(jp >> 16); glb[15] = (uint8_t)(jp >> 24);
+  memcpy(glb + 16, "JSON", 4);
+  memcpy(glb + 20, cycle_json, jl);
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse_glb(&model, &errors, glb, total, "", 0, &opts);
+  if (err != TG3_ERR_NODE_CYCLE) {
+    fprintf(stderr, "GLB node cycle expected TG3_ERR_NODE_CYCLE, got %d\n",
+            (int)err);
+  } else {
+    result = 1;
+  }
+  free(glb);
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return result;
+}
+
+static int check_validate_model_scratch_shortage(void) {
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"nodes\":[{\"children\":[1]},{}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options popts;
+  tg3_validation_options vopts;
+  uint8_t tiny_scratch[4];
+  tg3_error_code err;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&popts);
+  popts.validate_indices = 0;
+  popts.validate_ranges = 0;
+  popts.validate_node_graph = 0;
+  popts.validate_accessor_usage = 0;
+  if (tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1),
+                 "", 0, &popts) != TG3_OK) {
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_validation_options_init(&vopts);
+  err = tg3_validate_model(&model, &vopts, &errors, tiny_scratch,
+                           sizeof(tiny_scratch));
+  if (err != TG3_ERR_NODE_CYCLE) {
+    fprintf(stderr, "short scratch expected TG3_ERR_NODE_CYCLE, got %d\n",
+            (int)err);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
 int main(int argc, char **argv) {
   if (argc > 1) {
     int i;
@@ -2062,6 +2421,36 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (!check_extension_index_oob_rejected()) {
+    return 1;
+  }
+  if (!check_node_cycle_rejected()) {
+    return 1;
+  }
+  if (!check_glb_node_cycle_rejected()) {
+    return 1;
+  }
+  if (!check_node_cycle_opt_out()) {
+    return 1;
+  }
+  if (!check_duplicate_child_rejected()) {
+    return 1;
+  }
+  if (!check_acyclic_graph_accepted()) {
+    return 1;
+  }
+  if (!check_attribute_type_mismatch_rejected()) {
+    return 1;
+  }
+  if (!check_indices_accessor_type_rejected()) {
+    return 1;
+  }
+  if (!check_valid_primitive_accepted()) {
+    return 1;
+  }
+  if (!check_validate_model_independent()) {
+    return 1;
+  }
+  if (!check_validate_model_scratch_shortage()) {
     return 1;
   }
   if (!check_error_messages_survive_parse_failure()) {

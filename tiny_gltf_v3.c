@@ -116,6 +116,15 @@ static int tg3__vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
 #endif
 }
 
+static int tg3__snprintf(char *buf, size_t size, const char *fmt, ...) {
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = tg3__vsnprintf(buf, size, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
 #ifndef TINYGLTF3_MEMCPY
 #define TINYGLTF3_MEMCPY(dst, src, size) tg3__memcpy((dst), (src), (size))
 #endif
@@ -321,6 +330,7 @@ static void tg3__error_pushf(tg3_error_stack *es, tg3_arena *arena,
     int n;
     va_list ap;
     const char *msg = buf;
+    const char *path = json_path;
     if (!es) return;
     va_start(ap, fmt);
     n = tg3__vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -330,8 +340,15 @@ static void tg3__error_pushf(tg3_error_stack *es, tg3_arena *arena,
     if (arena) {
         char *dup = tg3__arena_strdup(arena, buf, (size_t)n);
         if (dup) msg = dup;
+        /* Callers may build the path in a stack buffer; the error stack
+         * stores the pointer, so arena-copy non-static paths too. */
+        if (json_path) {
+            char *path_dup = tg3__arena_strdup(arena, json_path,
+                                                TINYGLTF3_STRLEN(json_path));
+            if (path_dup) path = path_dup;
+        }
     }
-    tg3__error_push(es, sev, code, msg, json_path, -1);
+    tg3__error_push(es, sev, code, msg, path, -1);
 }
 
 TINYGLTF3_API int32_t tg3_errors_has_error(const tg3_error_stack *es) { return es ? es->has_error : 0; }
@@ -357,6 +374,19 @@ TINYGLTF3_API void tg3_parse_options_init(tg3_parse_options *options) {
     options->max_external_file_size = 0;
     options->validate_indices = 1;
     options->validate_ranges = 1;
+    options->validate_node_graph = 1;
+    options->validate_accessor_usage = 1;
+}
+
+TINYGLTF3_API void tg3_validation_options_init(tg3_validation_options *options) {
+    if (!options) return;
+    TINYGLTF3_MEMSET(options, 0, sizeof(*options));
+    options->strictness = TG3_PERMISSIVE;
+    options->check_indices = 1;
+    options->check_ranges = 1;
+    options->check_node_graph = 1;
+    options->check_accessor_usage = 1;
+    options->max_errors = 0;
 }
 
 TINYGLTF3_API void tg3_write_options_init(tg3_write_options *options) {
@@ -2238,6 +2268,227 @@ static int tg3__validate_resources(tg3__parse_ctx *ctx, const tg3_model *m) {
     return ok;
 }
 
+/* ---- Node graph validation ------------------------------------------------
+ * The node hierarchy is attacker-controlled JSON: children indices may point
+ * back at ancestors (cycle) or repeat. Either makes a naive recursive
+ * traversal loop forever or process one node twice. The check below is an
+ * iterative DFS started from every node (so cycles disconnected from any
+ * scene are still caught), using only caller-provided scratch bytes, so it
+ * cannot recurse on malicious input and never writes past nodes_count
+ * entries. */
+
+#define TG3__NODE_UNSEEN  0u
+#define TG3__NODE_ON_STACK 1u
+#define TG3__NODE_DONE    2u
+
+typedef struct tg3__frame {
+    uint32_t node;
+    uint32_t next_child;
+} tg3__frame;
+
+static void tg3__validate_graph_push(tg3__parse_ctx *ctx,
+                                     uint32_t node, uint32_t slot,
+                                     int32_t child, const char *reason) {
+    char path[64];
+    int n = tg3__snprintf(path, sizeof(path), "/nodes/%u/children/%u", node, slot);
+    if (n < 0 || (size_t)n >= sizeof(path)) path[0] = '\0';
+    tg3__error_pushf(ctx->errors, ctx->arena, TG3_SEVERITY_ERROR, TG3_ERR_NODE_CYCLE,
+                     path, "%s: nodes[%u].children[%u] = %d",
+                     reason, node, slot, child);
+}
+
+/* Returns 1 when the forest rooted at `root` is acyclic. `color` has
+ * nodes_count entries; `stack` is a caller-provided frame array of
+ * nodes_count entries (worst case: one frame per node). */
+static int tg3__validate_graph_dfs(tg3__parse_ctx *ctx, const tg3_model *m,
+                                   uint32_t root, uint8_t *color, tg3__frame *stack,
+                                   uint32_t *reported, uint32_t cap) {
+    int ok = 1;
+    uint32_t sp = 0;
+
+    if (color[root] != TG3__NODE_UNSEEN) return 1;
+    color[root] = TG3__NODE_ON_STACK;
+    stack[sp].node = root;
+    stack[sp].next_child = 0;
+    ++sp;
+
+    while (sp > 0) {
+        tg3__frame *fr = &stack[sp - 1];
+        const tg3_node *n = &m->nodes[fr->node];
+        if (fr->next_child >= n->children_count) {
+            color[fr->node] = TG3__NODE_DONE;
+            --sp;
+            continue;
+        }
+        uint32_t slot = fr->next_child++;
+        int32_t child_idx = n->children[slot];
+        if (child_idx < 0 || (uint32_t)child_idx >= m->nodes_count) {
+            continue; /* Out-of-range indices are reported by index validation. */
+        }
+        uint32_t child = (uint32_t)child_idx;
+        if (color[child] == TG3__NODE_ON_STACK) {
+            ok = 0;
+            if (cap == 0u || *reported < cap) {
+                tg3__validate_graph_push(ctx, fr->node, slot, child_idx,
+                                         "node hierarchy cycle");
+            }
+            ++(*reported);
+        } else if (color[child] == TG3__NODE_DONE) {
+            /* Reachable from two parents: the node would be visited twice by
+             * a forest traversal, which also breaks one-visit assumptions. */
+            ok = 0;
+            if (cap == 0u || *reported < cap) {
+                tg3__validate_graph_push(ctx, fr->node, slot, child_idx,
+                                         "duplicate node child reference");
+            }
+            ++(*reported);
+        } else {
+            color[child] = TG3__NODE_ON_STACK;
+            stack[sp].node = child;
+            stack[sp].next_child = 0;
+            ++sp;
+        }
+    }
+    return ok;
+}
+
+/* Checks every node, so cycles entirely disconnected from scenes are caught
+ * too. Needs nodes_count bytes of color scratch and nodes_count frames.
+ * Returns 1 when no cycle or duplicate reference exists. */
+static int tg3__validate_node_graph(tg3__parse_ctx *ctx, const tg3_model *m,
+                                    uint8_t *scratch, uint64_t scratch_size,
+                                    uint32_t cap) {
+    uint32_t i;
+    uint8_t *color;
+    tg3__frame *stack;
+    uint32_t reported = 0;
+    int ok = 1;
+    uint64_t need;
+
+    if (m->nodes_count == 0u) return 1;
+    /* Frame array first (uint32_t fields, needs 4-byte alignment), then the
+     * color byte array. Arena allocations are 8-byte aligned; for caller
+     * scratch we round the frame region up so color never overruns. */
+    need = (uint64_t)m->nodes_count * (uint32_t)sizeof(tg3__frame) +
+           (uint64_t)m->nodes_count;
+    if (!scratch || scratch_size < need) {
+        tg3__error_pushf(ctx->errors, ctx->arena, TG3_SEVERITY_ERROR,
+                         TG3_ERR_INVALID_NODE, "/nodes",
+                         "node graph validation needs %llu scratch bytes, got %llu",
+                         (unsigned long long)need,
+                         (unsigned long long)(scratch ? scratch_size : 0));
+        return 0;
+    }
+    stack = (tg3__frame *)scratch;
+    color = scratch + (uint64_t)m->nodes_count * (uint32_t)sizeof(tg3__frame);
+    for (i = 0; i < m->nodes_count; ++i) color[i] = TG3__NODE_UNSEEN;
+    for (i = 0; i < m->nodes_count; ++i) {
+        if (!tg3__validate_graph_dfs(ctx, m, i, color, stack, &reported, cap)) ok = 0;
+    }
+    return ok;
+}
+
+/* ---- Accessor usage (element type) validation -----------------------------
+ * Byte-range checks prove an accessor's data fits its bufferView; these
+ * checks prove the accessor's element shape matches how mesh primitives
+ * consume it, so decoders never interpret e.g. a SCALAR as a position. */
+
+static int tg3__is_integer_component(int32_t component_type) {
+    return component_type == TG3_COMPONENT_TYPE_BYTE ||
+           component_type == TG3_COMPONENT_TYPE_UNSIGNED_BYTE ||
+           component_type == TG3_COMPONENT_TYPE_SHORT ||
+           component_type == TG3_COMPONENT_TYPE_UNSIGNED_SHORT ||
+           component_type == TG3_COMPONENT_TYPE_INT ||
+           component_type == TG3_COMPONENT_TYPE_UNSIGNED_INT;
+}
+
+/* POSITION/NORMAL: VEC3 float; TANGENT: VEC4 float; TEXCOORD_*: VEC2;
+ * COLOR_*: VEC3/VEC4; JOINTS_*: VEC4 integer; WEIGHTS_*: VEC4. */
+static int tg3__attribute_shape_ok(const tg3_str *name, const tg3_accessor *a) {
+    static const char prefixes[][10] = {
+        "POSITION", "NORMAL", "TANGENT", "TEXCOORD_", "COLOR_",
+        "JOINTS_", "WEIGHTS_"
+    };
+    uint32_t k;
+    int is_float = a->component_type == TG3_COMPONENT_TYPE_FLOAT ||
+                   a->component_type == TG3_COMPONENT_TYPE_DOUBLE;
+
+    if (tg3__str_eq_cstr(name, "POSITION") || tg3__str_eq_cstr(name, "NORMAL")) {
+        return a->type == TG3_TYPE_VEC3 && is_float;
+    }
+    if (tg3__str_eq_cstr(name, "TANGENT")) {
+        return a->type == TG3_TYPE_VEC4 && is_float;
+    }
+    for (k = 3; k < 7u; ++k) {
+        size_t plen = TINYGLTF3_STRLEN(prefixes[k]);
+        if (name->len >= plen && TINYGLTF3_MEMCMP(name->data, prefixes[k], plen) == 0) {
+            switch (k) {
+                case 3: /* TEXCOORD_n */
+                    return a->type == TG3_TYPE_VEC2;
+                case 4: /* COLOR_n */
+                    return a->type == TG3_TYPE_VEC3 || a->type == TG3_TYPE_VEC4;
+                case 5: /* JOINTS_n */
+                    return a->type == TG3_TYPE_VEC4 &&
+                           tg3__is_integer_component(a->component_type);
+                case 6: /* WEIGHTS_n */
+                    return a->type == TG3_TYPE_VEC4;
+                default: break;
+            }
+        }
+    }
+    return 1; /* Unknown attribute names are extension-defined; do not flag. */
+}
+
+static int tg3__validate_accessor_usage(tg3__parse_ctx *ctx,
+                                        const tg3_model *m) {
+    uint32_t i, j, k;
+    int ok = 1;
+
+    for (i = 0; i < m->meshes_count; ++i) {
+        const tg3_mesh *me = &m->meshes[i];
+        for (j = 0; j < me->primitives_count; ++j) {
+            const tg3_primitive *p = &me->primitives[j];
+            char path[96];
+            if (p->indices >= 0 && (uint32_t)p->indices < m->accessors_count) {
+                const tg3_accessor *a = &m->accessors[p->indices];
+                if (a->type != TG3_TYPE_SCALAR ||
+                    !tg3__is_integer_component(a->component_type)) {
+                    tg3__snprintf(path, sizeof(path),
+                                  "/meshes/%u/primitives/%u/indices", i, j);
+                    tg3__error_pushf(ctx->errors, ctx->arena, TG3_SEVERITY_ERROR,
+                                     TG3_ERR_INVALID_ATTRIBUTE, path,
+                                     "indices accessor %d must be SCALAR with an "
+                                     "integer componentType (got type %d, componentType %d)",
+                                     p->indices, a->type, a->component_type);
+                    ok = 0;
+                }
+            }
+            for (k = 0; k < p->attributes_count; ++k) {
+                const tg3_str_int_pair *attr = &p->attributes[k];
+                if (attr->value < 0 || (uint32_t)attr->value >= m->accessors_count) {
+                    continue; /* Out-of-range accessor reported by index validation. */
+                }
+                if (!tg3__attribute_shape_ok(&attr->key,
+                                             &m->accessors[attr->value])) {
+                    tg3__snprintf(path, sizeof(path),
+                                  "/meshes/%u/primitives/%u/attributes/%u",
+                                  i, j, k);
+                    tg3__error_pushf(ctx->errors, ctx->arena, TG3_SEVERITY_ERROR,
+                                     TG3_ERR_INVALID_ATTRIBUTE, path,
+                                     "attribute '%.*s' accessor %d has incompatible "
+                                     "element type %d / componentType %d",
+                                     (int)attr->key.len, attr->key.data,
+                                     attr->value,
+                                     m->accessors[attr->value].type,
+                                     m->accessors[attr->value].component_type);
+                    ok = 0;
+                }
+            }
+        }
+    }
+    return ok;
+}
+
 /* ---- Verified core: spec-conformance rules ---------------------------------
  * Each tg3__spec_*_mask function is pure and returns a bitmask of violated
  * rules for one object. The bit assignments and predicates are mirrored
@@ -2576,6 +2827,27 @@ static tg3_error_code tg3__validate_model(tg3__parse_ctx *ctx, const tg3_model *
     if (ctx->opts.validate_ranges && !tg3__validate_resources(ctx, m)) {
         if (ret == TG3_OK) ret = TG3_ERR_INVALID_ACCESSOR;
     }
+    if (ctx->opts.validate_accessor_usage &&
+        !tg3__validate_accessor_usage(ctx, m)) {
+        if (ret == TG3_OK) ret = TG3_ERR_INVALID_ATTRIBUTE;
+    }
+    if (ctx->opts.validate_node_graph && m->nodes_count > 0u) {
+        uint64_t need = (uint64_t)m->nodes_count *
+                            (uint32_t)sizeof(tg3__frame) +
+                        (uint64_t)m->nodes_count;
+        uint8_t *scratch = ctx->arena
+                               ? (uint8_t *)tg3__arena_alloc(ctx->arena, need)
+                               : NULL;
+        if (!scratch) {
+            tg3__error_pushf(ctx->errors, ctx->arena, TG3_SEVERITY_ERROR,
+                             TG3_ERR_OUT_OF_MEMORY, "/nodes",
+                             "node graph validation scratch (%llu bytes) unavailable",
+                             (unsigned long long)need);
+            if (ret == TG3_OK) ret = TG3_ERR_OUT_OF_MEMORY;
+        } else if (!tg3__validate_node_graph(ctx, m, scratch, need, 0u)) {
+            if (ret == TG3_OK) ret = TG3_ERR_NODE_CYCLE;
+        }
+    }
     if (tg3__validate_spec(ctx, m) > 0u && ctx->opts.strictness == TG3_STRICT) {
         if (ret == TG3_OK) ret = TG3_ERR_INVALID_VALUE;
     }
@@ -2593,6 +2865,46 @@ TINYGLTF3_API tg3_error_code tg3_validate(const tg3_model *model,
     tg3_parse_options_init(&ctx.opts);
     ctx.opts.strictness = strictness;
     return tg3__validate_model(&ctx, model);
+}
+
+TINYGLTF3_API tg3_error_code tg3_validate_model(
+    const tg3_model *model, const tg3_validation_options *options,
+    tg3_error_stack *errors, uint8_t *scratch, uint64_t scratch_size) {
+    tg3_validation_options vopts;
+    tg3__parse_ctx ctx;
+    tg3_error_code ret = TG3_OK;
+    uint32_t cap;
+
+    if (!model) return TG3_ERR_INVALID_VALUE;
+    if (options) vopts = *options;
+    else tg3_validation_options_init(&vopts);
+    TINYGLTF3_MEMSET(&ctx, 0, sizeof(ctx));
+    ctx.arena = model->arena_;
+    ctx.errors = errors;
+    tg3_parse_options_init(&ctx.opts);
+    ctx.opts.strictness = vopts.strictness;
+    cap = vopts.max_errors;
+
+    if (vopts.check_indices && !tg3__validate_indices(&ctx, model)) {
+        ret = TG3_ERR_INVALID_INDEX;
+    }
+    if (vopts.check_ranges && !tg3__validate_resources(&ctx, model)) {
+        if (ret == TG3_OK) ret = TG3_ERR_INVALID_ACCESSOR;
+    }
+    if (vopts.check_accessor_usage &&
+        !tg3__validate_accessor_usage(&ctx, model)) {
+        if (ret == TG3_OK) ret = TG3_ERR_INVALID_ATTRIBUTE;
+    }
+    if (vopts.check_node_graph && model->nodes_count > 0u) {
+        if (!tg3__validate_node_graph(&ctx, model, scratch, scratch_size, cap)) {
+            if (ret == TG3_OK) ret = TG3_ERR_NODE_CYCLE;
+        }
+    }
+    if (vopts.strictness == TG3_STRICT &&
+        tg3__validate_spec(&ctx, model) > 0u) {
+        if (ret == TG3_OK) ret = TG3_ERR_INVALID_VALUE;
+    }
+    return ret;
 }
 
 static tg3_error_code tg3__parse_from_json(tg3__parse_ctx *ctx, const tg3json_value *json_doc, tg3_model *model) {
